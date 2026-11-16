@@ -9,7 +9,7 @@
 #include "rom_parser.h"
 
 /*
- * True only when every reachable path from `start` consumes a longword from
+ * True only when every reachable path from `start` consumes exactly one longword from
  * (A7)+ and reaches RTS without another stack operation or call. Both sides
  * of conditional branches are checked before and after the capture. Frame
  * reconstruction, unknown exits, cycles, malformed instructions and exhaustion
@@ -22,7 +22,8 @@
  */
 bool m68k_return_capture_is_unconditional(const GenesisRom *rom, uint32_t start);
 
-/* Every path must be understood by the same bounded proof, but plain RTS
- * exits may coexist with a capturing exit. This selects path-local RTS stack
- * accounting; it does not authorize unconditional call-site tail transfer. */
+/* Every path must be understood by the same bounded proof. Plain RTS exits
+ * may coexist with exits consuming complete return slots through longword,
+ * word or MOVEM pops. The path-local byte count selects the actual unwind;
+ * this does not authorize unconditional call-site tail transfer. */
 bool m68k_return_capture_has_capturing_exit(const GenesisRom *rom, uint32_t start);

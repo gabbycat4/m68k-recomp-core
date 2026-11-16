@@ -13,7 +13,7 @@ typedef enum {
 
 typedef struct {
     uint32_t pc;
-    bool captured;
+    unsigned popped;
     ProofState state;
 } ProofNode;
 
@@ -31,21 +31,24 @@ static bool ea_uses_sp(int ea)
         && (ea & 7) == 7;
 }
 
-static bool is_return_pop(const M68KInstr *ins)
+static unsigned return_pop_bytes(const M68KInstr *ins)
 {
-    if (ins->size != M68K_SIZE_L
+    if ((ins->size != M68K_SIZE_W && ins->size != M68K_SIZE_L)
             || ins->src_ea != ((EA_An_POST << 3) | 7)
             || ea_uses_sp(ins->dst_ea))
-        return false;
-
+        return 0;
+    unsigned width = ins->size == M68K_SIZE_L ? 4u : 2u;
     if (ins->mnemonic == MN_MOVE || ins->mnemonic == MN_MOVEA)
-        return true;
-
-    /* A nonempty MOVEM pop consumes the return slot too. Do not prove a
-     * transfer that also loads A7: its base-register semantics need analysis. */
-    return ins->mnemonic == MN_MOVEM
-        && ((ins->words[0] >> 10) & 1) != 0
-        && ins->words[1] != 0 && (ins->words[1] & 0x8000) == 0;
+        return width;
+    /* Loading A7 rebuilds the frame rather than merely consuming slots. */
+    if (ins->mnemonic == MN_MOVEM && ((ins->words[0] >> 10) & 1) != 0
+            && ins->words[1] != 0 && (ins->words[1] & 0x8000) == 0) {
+        unsigned count = 0;
+        for (unsigned bit = 0; bit < 16; bit++)
+            count += (ins->words[1] >> bit) & 1u;
+        return count * width;
+    }
+    return 0;
 }
 
 static bool invalid_stack_operation(const M68KInstr *ins)
@@ -89,10 +92,10 @@ static bool invalid_stack_operation(const M68KInstr *ins)
     }
 }
 
-static bool prove_from(ProofContext *ctx, uint32_t pc, bool captured)
+static bool prove_from(ProofContext *ctx, uint32_t pc, unsigned popped)
 {
     for (int i = 0; i < ctx->node_count; i++) {
-        if (ctx->nodes[i].pc == pc && ctx->nodes[i].captured == captured)
+        if (ctx->nodes[i].pc == pc && ctx->nodes[i].popped == popped)
             return ctx->nodes[i].state == PROOF_TRUE;
     }
 
@@ -103,7 +106,7 @@ static bool prove_from(ProofContext *ctx, uint32_t pc, bool captured)
 
     int node_index = ctx->node_count++;
     ctx->nodes[node_index].pc = pc;
-    ctx->nodes[node_index].captured = captured;
+    ctx->nodes[node_index].popped = popped;
     ctx->nodes[node_index].state = PROOF_VISITING;
 
     M68KInstr ins;
@@ -113,31 +116,35 @@ static bool prove_from(ProofContext *ctx, uint32_t pc, bool captured)
         goto done;
 
     uint32_t fallthrough = pc + ins.byte_length;
-    if (!captured && is_return_pop(&ins)) {
-        result = prove_from(ctx, fallthrough, true);
+    unsigned pop_bytes = return_pop_bytes(&ins);
+    if (pop_bytes && (ctx->allow_plain_exit
+            || (!popped && pop_bytes == 4 && ins.size == M68K_SIZE_L))) {
+        result = prove_from(ctx, fallthrough, popped + pop_bytes);
         goto done;
     }
     if (invalid_stack_operation(&ins))
         goto done;
 
     switch (ins.mnemonic) {
-    case MN_RTS:
-        /* A genuine capture leaves the original return slot consumed. RTS
-         * then returns to the caller's caller. Rebuilding a split frame or
-         * restoring that slot on any preceding path invalidates this proof. */
-        ctx->has_capturing_exit |= captured;
-        result = captured || ctx->allow_plain_exit;
+    case MN_RTS: {
+        /* Local unwind may consume several complete slots, including slots
+         * popped as words. Only a single longword permits an unconditional
+         * call-site tail transfer; partial slots remain unproven. */
+        bool whole_slots = popped >= 4 && (popped & 3u) == 0;
+        ctx->has_capturing_exit |= whole_slots;
+        result = ctx->allow_plain_exit ? (popped & 3u) == 0 : popped == 4;
         break;
+    }
     case MN_Bcc:
     case MN_DBcc:
         if (ins.has_target)
-            result = prove_from(ctx, ins.target_addr, captured)
-                  && prove_from(ctx, fallthrough, captured);
+            result = prove_from(ctx, ins.target_addr, popped)
+                  && prove_from(ctx, fallthrough, popped);
         break;
     case MN_BRA:
     case MN_JMP:
         if (ins.has_target)
-            result = prove_from(ctx, ins.target_addr, captured);
+            result = prove_from(ctx, ins.target_addr, popped);
         break;
     case MN_OTHER:
     case MN_STOP:
@@ -147,7 +154,7 @@ static bool prove_from(ProofContext *ctx, uint32_t pc, bool captured)
         break;
     default:
         if (!m68k_is_terminator(&ins))
-            result = prove_from(ctx, fallthrough, captured);
+            result = prove_from(ctx, fallthrough, popped);
         break;
     }
 
@@ -162,7 +169,7 @@ bool m68k_return_capture_is_unconditional(const GenesisRom *rom, uint32_t start)
         return false;
     ProofContext ctx = {0};
     ctx.rom = rom;
-    return prove_from(&ctx, start, false);
+    return prove_from(&ctx, start, 0);
 }
 
 bool m68k_return_capture_has_capturing_exit(const GenesisRom *rom, uint32_t start)
@@ -172,5 +179,5 @@ bool m68k_return_capture_has_capturing_exit(const GenesisRom *rom, uint32_t star
     ProofContext ctx = {0};
     ctx.rom = rom;
     ctx.allow_plain_exit = true;
-    return prove_from(&ctx, start, false) && ctx.has_capturing_exit;
+    return prove_from(&ctx, start, 0) && ctx.has_capturing_exit;
 }

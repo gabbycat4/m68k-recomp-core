@@ -71,6 +71,21 @@ int main(void)
     EXIT_CASE("unknown branch exit still invalidates local capture proof", false,
               0x6608, 0x205F, 0x4E75);
 
+    CASE("multiple longword captures need counted local unwind", false,
+         0x281F, 0x2A1F, 0x4E75);
+    EXIT_CASE("multiple longword captures select local unwind", true,
+              0x281F, 0x2A1F, 0x4E75);
+    CASE("MOVEM of multiple slots is not a single-slot tail", false,
+         0x4CDF, 0x0030, 0x4E75);
+    EXIT_CASE("MOVEM of multiple slots selects counted unwind", true,
+              0x4CDF, 0x0030, 0x4E75);
+    EXIT_CASE("two word pops consume one complete return slot", true,
+              0x381F, 0x3A1F, 0x4E75);
+    EXIT_CASE("mixed-width pops consume complete return slots", true,
+              0x381F, 0x2A1F, 0x3C1F, 0x4E75);
+    EXIT_CASE("a partial return-slot pop is not proven", false, 0x381F, 0x4E75);
+    EXIT_CASE("unbounded pop cycle is not proven", false, 0x281F, 0x60FC);
+
     /* Genuine captures leave the slot consumed: the RTS skips the caller. */
     CASE("store return address then RTS", true,
          0x3140, 0x0024, 0x215F, 0x0002, 0x4E75);
