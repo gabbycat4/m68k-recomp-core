@@ -13,6 +13,7 @@
 #include "m68k_decoder.h"
 #include "m68k_validator.h"
 #include "function_finder.h"
+#include "return_capture.h"
 #include "annotations.h"
 #include "game_config.h"
 #include "portable_io.h"
@@ -2030,11 +2031,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * the rts. Treating those as a consumed return address makes the caller
          * skip its own return-slot pop, leaking 4 bytes per call (observed as a
          * growing A7 divergence in the Tier-3 co-simulation at $0E34). Only a
-         * callee PROVEN to capture the return, or one that explicitly skips
+         * callee with a PROVEN capturing exit (the path-local byte count
+         * decides whether that exit ran), or one that explicitly skips
          * stack through ADDQ/SUBQ (SMPS stop-track), may consume the slot. */
         if (*has_sp_adjust
                 && (s_func_explicit_sp_skip
-                    || function_finder_pops_return_unconditionally(rom, func_addr))) {
+                    || m68k_return_capture_has_capturing_exit(rom, func_addr))) {
             fprintf(f, "  if (_sp_popped >= 4) { g_rte_pending = _sp_popped / 4; _sp_popped = 0; }\n");
             fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         } else {

@@ -21,6 +21,8 @@ typedef struct {
     const GenesisRom *rom;
     ProofNode nodes[RETURN_CAPTURE_MAX_NODES];
     int node_count;
+    bool allow_plain_exit;
+    bool has_capturing_exit;
 } ProofContext;
 
 static bool ea_uses_sp(int ea)
@@ -123,7 +125,8 @@ static bool prove_from(ProofContext *ctx, uint32_t pc, bool captured)
         /* A genuine capture leaves the original return slot consumed. RTS
          * then returns to the caller's caller. Rebuilding a split frame or
          * restoring that slot on any preceding path invalidates this proof. */
-        result = captured;
+        ctx->has_capturing_exit |= captured;
+        result = captured || ctx->allow_plain_exit;
         break;
     case MN_Bcc:
     case MN_DBcc:
@@ -160,4 +163,14 @@ bool m68k_return_capture_is_unconditional(const GenesisRom *rom, uint32_t start)
     ProofContext ctx = {0};
     ctx.rom = rom;
     return prove_from(&ctx, start, false);
+}
+
+bool m68k_return_capture_has_capturing_exit(const GenesisRom *rom, uint32_t start)
+{
+    if (!rom)
+        return false;
+    ProofContext ctx = {0};
+    ctx.rom = rom;
+    ctx.allow_plain_exit = true;
+    return prove_from(&ctx, start, false) && ctx.has_capturing_exit;
 }

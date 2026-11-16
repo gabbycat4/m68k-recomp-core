@@ -21,9 +21,10 @@ uint32_t rom_read32(const GenesisRom *rom, uint32_t addr)
 }
 
 static void check(const char *name, const GenesisRom *rom, uint32_t start,
-                  bool expected)
+                  bool expected, bool allow_plain)
 {
-    bool actual = m68k_return_capture_is_unconditional(rom, start);
+    bool actual = allow_plain ? m68k_return_capture_has_capturing_exit(rom, start)
+                              : m68k_return_capture_is_unconditional(rom, start);
     checks++;
     if (actual != expected) {
         fprintf(stderr, "FAIL %s: expected %s, got %s\n", name,
@@ -33,7 +34,7 @@ static void check(const char *name, const GenesisRom *rom, uint32_t start,
 }
 
 static void check_words(const char *name, const uint16_t *words, size_t count,
-                        bool expected)
+                        bool expected, bool allow_plain)
 {
     uint8_t bytes[512];
     if (count > sizeof(bytes) / 2) {
@@ -46,16 +47,30 @@ static void check_words(const char *name, const uint16_t *words, size_t count,
         bytes[i * 2 + 1] = (uint8_t)words[i];
     }
     GenesisRom rom = {bytes, (uint32_t)(count * 2)};
-    check(name, &rom, 0, expected);
+    check(name, &rom, 0, expected, allow_plain);
 }
 
 #define CASE(name, expected, ...) do { \
     const uint16_t words[] = {__VA_ARGS__}; \
-    check_words(name, words, sizeof(words) / sizeof(words[0]), expected); \
+    check_words(name, words, sizeof(words) / sizeof(words[0]), expected, false); \
+} while (0)
+
+#define EXIT_CASE(name, expected, ...) do { \
+    const uint16_t words[] = {__VA_ARGS__}; \
+    check_words(name, words, sizeof(words) / sizeof(words[0]), expected, true); \
 } while (0)
 
 int main(void)
 {
+    EXIT_CASE("conditional single-slot capture selects local unwind", true,
+              0x4A46, 0x6602, 0x281F, 0x4E75);
+    EXIT_CASE("plain RTS alone does not select capture", false, 0x4E75);
+    EXIT_CASE("known unconditional capture selects local unwind", true, 0x205F, 0x4E75);
+    EXIT_CASE("a frame rebuild still invalidates local capture proof", false,
+              0x205F, 0x2F08, 0x4E75);
+    EXIT_CASE("unknown branch exit still invalidates local capture proof", false,
+              0x6608, 0x205F, 0x4E75);
+
     /* Genuine captures leave the slot consumed: the RTS skips the caller. */
     CASE("store return address then RTS", true,
          0x3140, 0x0024, 0x215F, 0x0002, 0x4E75);
@@ -119,16 +134,16 @@ int main(void)
     for (size_t i = 1; i < 98; i++) delayed[i] = 0x4E71;
     delayed[10] = 0x2F08;
     delayed[11] = 0x4E75;
-    check_words("restore beyond eight-instruction lookahead", delayed, 12, false);
+    check_words("restore beyond eight-instruction lookahead", delayed, 12, false, false);
     delayed[10] = delayed[11] = 0x4E71;
     delayed[95] = 0x4E75;
-    check_words("genuine return at node budget", delayed, 96, true);
+    check_words("genuine return at node budget", delayed, 96, true, false);
     delayed[95] = 0x4E71;
     delayed[96] = 0x4E75;
-    check_words("genuine return beyond node budget is unproven", delayed, 97, false);
+    check_words("genuine return beyond node budget is unproven", delayed, 97, false, false);
     delayed[96] = 0x2F08;
     delayed[97] = 0x4E75;
-    check_words("restoration beyond node budget is unproven", delayed, 98, false);
+    check_words("restoration beyond node budget is unproven", delayed, 98, false, false);
 
     CASE("truncated capture destination extension", false, 0x215F);
     CASE("truncated branch extension", false, 0x205F, 0x6000);
@@ -140,12 +155,12 @@ int main(void)
     CASE("TRAP after capture", false, 0x205F, 0x4E40, 0x4E75);
     uint8_t bytes[] = {0x20, 0x5F, 0x4E, 0x75};
     GenesisRom rom = {bytes, sizeof(bytes)};
-    check("odd entry", &rom, 1, false);
-    check("entry at end", &rom, sizeof(bytes), false);
-    check("overflowing entry", &rom, UINT32_MAX, false);
+    check("odd entry", &rom, 1, false, false);
+    check("entry at end", &rom, sizeof(bytes), false, false);
+    check("overflowing entry", &rom, UINT32_MAX, false, false);
     rom.rom_size = 3;
-    check("truncated final opcode", &rom, 0, false);
-    check("null image", NULL, 0, false);
+    check("truncated final opcode", &rom, 0, false, false);
+    check("null image", NULL, 0, false, false);
 
     printf("return_capture_test: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;

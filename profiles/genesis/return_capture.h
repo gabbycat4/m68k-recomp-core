@@ -21,3 +21,8 @@
  * unproven; the caller must retain ordinary/dynamic return handling.
  */
 bool m68k_return_capture_is_unconditional(const GenesisRom *rom, uint32_t start);
+
+/* Every path must be understood by the same bounded proof, but plain RTS
+ * exits may coexist with a capturing exit. This selects path-local RTS stack
+ * accounting; it does not authorize unconditional call-site tail transfer. */
+bool m68k_return_capture_has_capturing_exit(const GenesisRom *rom, uint32_t start);
