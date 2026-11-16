@@ -5188,7 +5188,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
          * ADDQ stack skips, this must include MOVE/MOVEM postincrement pops:
          * a helper may consume its JSR return slot on only one branch, which
          * cannot be classified as either an ordinary or an unconditional
-         * return-capturing callee at the call site. */
+         * return-capturing callee at the call site. Keep scanning past saved
+         * data operations: a later explicit skip still needs RTS propagation. */
         int has_sp_adjust = 0;
         int explicit_sp_skip = 0;
         for (int j = 0; j < instrs.count; j++) {
@@ -5210,16 +5211,13 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                 if ((pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
                         && pre.src_ea == ((EA_An_POST << 3) | 7)) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_MOVE
                         && pre.dst_ea == ((EA_An_PRE << 3) | 7)) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_PEA) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_MOVEM) {
                     int dir = (pre.words[0] >> 10) & 1;
@@ -5229,7 +5227,6 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                             && ((dir == 1 && mode == 3)
                                 || (dir == 0 && mode == 4))) {
                         has_sp_adjust = 1;
-                        break;
                     }
                 }
             }
