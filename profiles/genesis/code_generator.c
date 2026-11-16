@@ -2266,8 +2266,14 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
              * final rts slot back and unwind that many C frames, exactly as the
              * guest did. Ordinary callees leave A7 at the slot, so this is a
              * no-op for them. */
-            fprintf(f, "  { int _tail_k = (int)((g_cpu.A[7] - _jsr_slot_sp_%06X) / 4u);\n", addr);
-            fprintf(f, "    if (_tail_k >= 2) { g_cpu.A[7] += 4u; g_rte_pending = _tail_k; } }\n");
+            /* A split prologue may return with a rebuilt frame below the JSR
+             * slot. Infer consumed returns only from forward whole-slot motion,
+             * never unsigned underflow or a rounded partial-slot adjustment. */
+            fprintf(f, "  { uint32_t _tail_sp = g_cpu.A[7];\n");
+            fprintf(f, "    if (_tail_sp >= _jsr_slot_sp_%06X &&\n", addr);
+            fprintf(f, "        ((_tail_sp - _jsr_slot_sp_%06X) %% 4u) == 0) {\n", addr);
+            fprintf(f, "      int _tail_k = (int)((_tail_sp - _jsr_slot_sp_%06X) / 4u);\n", addr);
+            fprintf(f, "      if (_tail_k >= 2) { g_cpu.A[7] += 4u; g_rte_pending = _tail_k; } } }\n");
         } else {
             codegen_diag_record(CGD_TODO_DYNAMIC_JSR_UNSUPPORTED, addr,
                                 instr->words[0], instr->mnemonic,
