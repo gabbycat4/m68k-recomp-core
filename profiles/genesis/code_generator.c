@@ -5208,11 +5208,6 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     explicit_sp_skip = 1;   /* immediate ADD/SUB to SP */
                     break;
                 }
-                if ((pre.mnemonic == MN_ADDA || pre.mnemonic == MN_SUBA) &&
-                        pre.reg == 7 && pre.src_ea == ((7 << 3) | 4)) {
-                    has_sp_adjust = 1;
-                    break;
-                }
                 if ((pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
                         && pre.src_ea == ((EA_An_POST << 3) | 7)) {
                     has_sp_adjust = 1;
