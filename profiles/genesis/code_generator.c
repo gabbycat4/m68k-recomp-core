@@ -13,6 +13,7 @@
 #include "m68k_decoder.h"
 #include "m68k_validator.h"
 #include "function_finder.h"
+#include "return_capture.h"
 #include "annotations.h"
 #include "game_config.h"
 #include "portable_io.h"
@@ -31,6 +32,10 @@
  * single-threaded. */
 static const char      *s_diag_func_name = NULL;
 static uint32_t         s_diag_func_addr = 0;
+/* Set per function by the stack pre-scan: true only when the function
+ * adjusts SP by an explicit ADDQ/SUBQ skip (the SMPS stop-track case),
+ * as opposed to merely restoring saved registers through (SP)+. */
+static int s_func_explicit_sp_skip = 0;
 static const M68KInstr *s_diag_instr     = NULL;
 /* Active only while emitting a proven unobservable register span. Ordinary
  * instruction emission retains every architectural flag write. */
@@ -2021,7 +2026,17 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * through the C callers; a boolean loses the second unwind and
          * resumes code the guest deliberately skipped. Tail edges do not
          * consume this count; each actual JSR/BSR caller consumes one. */
-        if (*has_sp_adjust) {
+        /* _sp_popped counts EVERY (SP)+ for this function, including ordinary
+         * saved-register restores such as `move.w (a7)+,d0` immediately before
+         * the rts. Treating those as a consumed return address makes the caller
+         * skip its own return-slot pop, leaking 4 bytes per call (observed as a
+         * growing A7 divergence in the Tier-3 co-simulation at $0E34). Only a
+         * callee with a PROVEN capturing exit (the path-local byte count
+         * decides whether that exit ran), or one that explicitly skips
+         * stack through ADDQ/SUBQ (SMPS stop-track), may consume the slot. */
+        if (*has_sp_adjust
+                && (s_func_explicit_sp_skip
+                    || m68k_return_capture_has_capturing_exit(rom, func_addr))) {
             fprintf(f, "  if (_sp_popped >= 4) { g_rte_pending = _sp_popped / 4; _sp_popped = 0; }\n");
             fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         } else {
@@ -2244,6 +2259,21 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "    recomp_call_addr(%s);\n", ae);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
+            /* A callee reached through a pointer may return past us: Shadowrun's
+             * check-out confirm at $DA6A pops the caller's return AND the
+             * dispatcher's return, then rts's past both. A7 tells us how many
+             * slots it really consumed. When it took more than its own, put the
+             * final rts slot back and unwind that many C frames, exactly as the
+             * guest did. Ordinary callees leave A7 at the slot, so this is a
+             * no-op for them. */
+            /* A split prologue may return with a rebuilt frame below the JSR
+             * slot. Infer consumed returns only from forward whole-slot motion,
+             * never unsigned underflow or a rounded partial-slot adjustment. */
+            fprintf(f, "  { uint32_t _tail_sp = g_cpu.A[7];\n");
+            fprintf(f, "    if (_tail_sp >= _jsr_slot_sp_%06X &&\n", addr);
+            fprintf(f, "        ((_tail_sp - _jsr_slot_sp_%06X) %% 4u) == 0) {\n", addr);
+            fprintf(f, "      int _tail_k = (int)((_tail_sp - _jsr_slot_sp_%06X) / 4u);\n", addr);
+            fprintf(f, "      if (_tail_k >= 2) { g_cpu.A[7] += 4u; g_rte_pending = _tail_k; } } }\n");
         } else {
             codegen_diag_record(CGD_TODO_DYNAMIC_JSR_UNSUPPORTED, addr,
                                 instr->words[0], instr->mnemonic,
@@ -5166,8 +5196,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
          * ADDQ stack skips, this must include MOVE/MOVEM postincrement pops:
          * a helper may consume its JSR return slot on only one branch, which
          * cannot be classified as either an ordinary or an unconditional
-         * return-capturing callee at the call site. */
+         * return-capturing callee at the call site. Keep scanning past saved
+         * data operations: a later explicit skip still needs RTS propagation. */
         int has_sp_adjust = 0;
+        int explicit_sp_skip = 0;
         for (int j = 0; j < instrs.count; j++) {
             M68KInstr pre;
             if (m68k_decode(rom, instrs.addrs[j], &pre)) {
@@ -5175,26 +5207,25 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     ((pre.src_ea >> 3) & 7) == 1 && (pre.src_ea & 7) == 7 &&
                     pre.imm32 > 0) {
                     has_sp_adjust = 1;
+                    explicit_sp_skip = 1;
                     break;
                 }
                 if ((pre.mnemonic == MN_ADDA || pre.mnemonic == MN_SUBA) &&
                         pre.reg == 7 && pre.src_ea == ((7 << 3) | 4)) {
                     has_sp_adjust = 1;
+                    explicit_sp_skip = 1;   /* immediate ADD/SUB to SP */
                     break;
                 }
                 if ((pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
                         && pre.src_ea == ((EA_An_POST << 3) | 7)) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_MOVE
                         && pre.dst_ea == ((EA_An_PRE << 3) | 7)) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_PEA) {
                     has_sp_adjust = 1;
-                    break;
                 }
                 if (pre.mnemonic == MN_MOVEM) {
                     int dir = (pre.words[0] >> 10) & 1;
@@ -5204,11 +5235,11 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                             && ((dir == 1 && mode == 3)
                                 || (dir == 0 && mode == 4))) {
                         has_sp_adjust = 1;
-                        break;
                     }
                 }
             }
         }
+        s_func_explicit_sp_skip = explicit_sp_skip;
         if (has_sp_adjust) {
             /* A generated split-function tail call is one 68K control-flow
              * path, not a real JSR boundary.  Consume its carried net stack
