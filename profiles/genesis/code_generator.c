@@ -1226,6 +1226,117 @@ static void report_misaligned_entries_in_range(uint32_t pc, uint32_t len,
 }
 
 /* =========================================================================
+ * probe_stub_table_rom — JMP (d8,PC,Xn) into a table of fixed-size code stubs.
+ *
+ * Pattern (Warriors of the Eternal Sun: step/turn by facing, 9 sites):
+ *     andi.w #3,d2
+ *     asl.w  #2,d2              ; (or lsr of a masked field, adda.w a0,a0 x2)
+ *     jmp    2(pc,d2.w)
+ *   .t0: subq.w #1,d1 ; bra.s .join
+ *   .t1: addq.w #1,d0 ; bra.s .join
+ *   .t2: addq.w #1,d1 ; bra.s .join
+ *   .t3: subq.w #1,d0           ; last stub falls through
+ *   .join: ...
+ *
+ * The index is a byte offset (stride * i), so every landing point is an
+ * interior PC of the current function, like a Duff's device, but the stubs
+ * are not one uniform instruction, so probe_pc_idx_targets misses them.
+ *
+ * Signature (structural, independent of how the index was computed):
+ *   - the table starts right after the JMP (base == JMP address + 4);
+ *   - every stub but the last is one non-branch instruction followed by a
+ *     BRA, all stubs the same size (the stride);
+ *   - every BRA lands on the same address, which is exactly where the last
+ *     stub (one non-branch instruction, no BRA) ends;
+ *   - at least 2 stubs.
+ * Reads the ROM only, so it is usable at scan time (seeding) and codegen.
+ * ========================================================================= */
+static bool stub_insn_ok(const M68KInstr *a)
+{
+    if (m68k_is_terminator(a) || m68k_is_call(a)) return false;
+    switch (a->mnemonic) {
+    case MN_BRA: case MN_Bcc: case MN_DBcc: case MN_JMP: case MN_BSR:
+    case MN_RTS: case MN_ILLEGAL:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static int probe_stub_table_rom(const GenesisRom *rom,
+                                const M68KInstr *jmp_instr,
+                                uint32_t *out_targets,
+                                int max_targets)
+{
+    if (!rom || !jmp_instr || max_targets < 2) return 0;
+    if (jmp_instr->word_count < 2 || jmp_instr->byte_length != 4) return 0;
+    if (jmp_instr->src_ea != 0x3B) return 0;           /* (d8, PC, Xn) */
+    uint16_t ext  = jmp_instr->words[1];
+    int8_t   d8   = (int8_t)(ext & 0xFF);
+    uint32_t base = (uint32_t)(jmp_instr->addr + 2 + (int32_t)d8);
+    if (base != jmp_instr->addr + 4) return 0;          /* table follows JMP */
+
+    /* Variant: a table of bare branches (BRA.S/BRA.W, all the same size),
+     *     add.w d0,d0 / jmp 2(pc,d0.w) / bra.s A / bra.s A / bra.s B / bra.s B
+     * (WotES $02054E). Each entry is itself an instruction, so the landing
+     * points are the BRA addresses and the BRAs carry control onward. */
+    {
+        M68KInstr b0;
+        if (m68k_decode(rom, base, &b0) && b0.mnemonic == MN_BRA && b0.has_target) {
+            uint32_t len = b0.byte_length;
+            int nb = 0;
+            for (int i = 0; i < max_targets; i++) {
+                uint32_t t = base + (uint32_t)i * len;
+                M68KInstr bi;
+                if (t + 1 >= rom->rom_size || !m68k_decode(rom, t, &bi) ||
+                    bi.mnemonic != MN_BRA || !bi.has_target || bi.byte_length != len)
+                    break;
+                out_targets[nb++] = t;
+            }
+            /* The highest index often lands on inline code right after the
+             * last BRA instead of another BRA (WotES $01FD4C: 3x BRA.S then
+             * EXG/NEG/RTS at $01FD5C; $01FEBE: 8x BRA.W then $01FEE2;
+             * $00D106). Include it when it decodes as an ordinary
+             * (non-branch) instruction. */
+            if (nb >= 2 && nb < max_targets) {
+                uint32_t t = base + (uint32_t)nb * len;
+                M68KInstr tail;
+                if (t + 1 < rom->rom_size && m68k_decode(rom, t, &tail) &&
+                    stub_insn_ok(&tail))
+                    out_targets[nb++] = t;
+            }
+            return nb >= 2 ? nb : 0;
+        }
+    }
+
+    uint32_t stride = 0, join = 0;
+    int n = 0;
+    for (int i = 0; i < max_targets; i++) {
+        uint32_t t = stride ? base + (uint32_t)i * stride : base;
+        if (t + 1 >= rom->rom_size) return 0;
+        M68KInstr a;
+        if (!m68k_decode(rom, t, &a) || !stub_insn_ok(&a)) return 0;
+        uint32_t after = t + a.byte_length;
+        M68KInstr b;
+        bool has_bra = m68k_decode(rom, after, &b) && b.mnemonic == MN_BRA &&
+                       b.has_target;
+        if (has_bra) {
+            uint32_t size = a.byte_length + b.byte_length;
+            if (stride == 0) { stride = size; join = b.target_addr; }
+            else if (size != stride || b.target_addr != join) return 0;
+            out_targets[n++] = t;
+            continue;
+        }
+        /* Last stub: one instruction that falls through to the join. */
+        if (stride == 0 || n < 1) return 0;
+        if (after != join || a.byte_length > stride) return 0;
+        out_targets[n++] = t;
+        return n;
+    }
+    return 0;                       /* no terminating stub within the cap */
+}
+
+/* =========================================================================
  * probe_pc_idx_targets — find interior-label dispatch targets of a
  * `JMP (d8, PC, Xn)` instruction.
  *
@@ -1306,6 +1417,20 @@ static int probe_pc_idx_targets(const GenesisRom *rom,
         if (probe.words[0] != first_op)  break;
         if (probe.byte_length != first_len) break;
         out_targets[n++] = t;
+    }
+    if (n < 2) {
+        /* Not a uniform sequence: try a table of fixed-size code stubs.
+         * Accept it only when every landing point is in this function. */
+        uint32_t st[32];
+        int ns = probe_stub_table_rom(rom, jmp_instr, st,
+                                      max_targets < 32 ? max_targets : 32);
+        int ok = ns >= 2;
+        for (int k = 0; ok && k < ns; k++)
+            if (!addrset_contains(instrs, st[k])) ok = 0;
+        if (ok) {
+            for (int k = 0; k < ns; k++) out_targets[k] = st[k];
+            return ns;
+        }
     }
     return n;
 }
@@ -1418,6 +1543,14 @@ static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
         uint16_t w = ((uint16_t)rom->rom_data[a] << 8) | rom->rom_data[a + 1];
         if (w != op0) break;
         n_same++;
+    }
+    {
+        uint32_t st[32];
+        int ns = probe_stub_table_rom(rom, jmp_instr, st, 32);
+        if (ns >= 2) {
+            for (int k = 0; k < ns; k++) addrset_insert(worklist, st[k]);
+            return;
+        }
     }
     if (n_same >= 8) {
         /* Seed every Duff's-device target. Each falls naturally into either
@@ -2398,9 +2531,19 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     seen_offsets[seen_count++] = off;
                     fprintf(f, "    case %d: goto label_%06X;\n", off, pc_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + "
-                        "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d])); return;\n",
-                        base, ext, xreg, xreg);
+                /* A computed JMP is a tail edge of this 68K routine, not a
+                 * call: carry the path-local stack delta (e.g. a MOVEM push
+                 * at the routine's entry) to the split code it lands in,
+                 * exactly like emit_split_tail_call(). Dropping it makes the
+                 * routine's shared MOVEM-pop/RTS tail look like a
+                 * return-slot skip (g_rte_pending), unwinding callers that
+                 * must not be unwound (Warriors of the Eternal Sun $020294,
+                 * dungeon adjacency check by facing). */
+                fprintf(f, "    default: %shybrid_jmp_interpret(0x%08Xu + "
+                        "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]));%s return;\n",
+                        *has_sp_adjust ? "g_split_sp_popped += _sp_popped; _sp_popped = 0; " : "",
+                        base, ext, xreg, xreg,
+                        *has_sp_adjust ? " g_split_sp_popped = 0;" : "");
                 fprintf(f, "  }\n");
             } else if (not_ >= 1) {
                 /* Case (b): offset-table dispatch — `dc.w (target - base)`
@@ -2424,9 +2567,19 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     fprintf(f, "    case %d: goto label_%06X;\n",
                             ot_offsets[t], ot_targets[t]);
                 } }
-                fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + "
-                        "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d])); return;\n",
-                        base, ext, xreg, xreg);
+                /* A computed JMP is a tail edge of this 68K routine, not a
+                 * call: carry the path-local stack delta (e.g. a MOVEM push
+                 * at the routine's entry) to the split code it lands in,
+                 * exactly like emit_split_tail_call(). Dropping it makes the
+                 * routine's shared MOVEM-pop/RTS tail look like a
+                 * return-slot skip (g_rte_pending), unwinding callers that
+                 * must not be unwound (Warriors of the Eternal Sun $020294,
+                 * dungeon adjacency check by facing). */
+                fprintf(f, "    default: %shybrid_jmp_interpret(0x%08Xu + "
+                        "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]));%s return;\n",
+                        *has_sp_adjust ? "g_split_sp_popped += _sp_popped; _sp_popped = 0; " : "",
+                        base, ext, xreg, xreg,
+                        *has_sp_adjust ? " g_split_sp_popped = 0;" : "");
                 fprintf(f, "  }\n");
             } else {
                 /* Case (c): nothing recognised — fall back to runtime dispatch. */
@@ -2435,9 +2588,17 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "  /* JMP table at $%06X: interpret handler at base $%06X + %s[%d] */\n",
                         instr->addr, base, xr + 6 /* skip "g_cpu." */, xreg);
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+                /* Tail edge: carry the stack delta (see the switch default
+                 * above). After the handler chain returns, the delta has been
+                 * consumed by its final RTS (or the Tier-3 floor ran the whole
+                 * tail), so nothing may leak into the next routine. */
+                if (*has_sp_adjust)
+                    fprintf(f, "  g_split_sp_popped += _sp_popped; _sp_popped = 0;\n");
                 fprintf(f, "  hybrid_jmp_interpret(0x%08Xu + "
                         "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]));\n",
                         base, ext, xreg, xreg);
+                if (*has_sp_adjust)
+                    fprintf(f, "  g_split_sp_popped = 0;\n");
                 fprintf(f, "  return;\n");
             }
         } else {
